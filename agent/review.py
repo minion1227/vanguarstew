@@ -8,6 +8,9 @@ rubric (see REVIEW.md) and the `mult:*` value ladder, so it slots straight into 
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 SYSTEM = (
     "You are an experienced repository maintainer reviewing a pull request. Assess it on the "
@@ -36,7 +39,13 @@ _ACTION_SYNONYMS = {
 
 def _normalize_review_action(action) -> str:
     """Map ``action`` onto ``ACTIONS``; unknown values fall back to ``comment``."""
-    key = (action or "").strip().lower()
+    if not isinstance(action, str):
+        logger.warning(
+            "review_pr: LLM returned a non-string action field (%s: %r); defaulting to 'comment'",
+            type(action).__name__, action,
+        )
+        return "comment"
+    key = action.strip().lower()
     if key in ACTIONS:
         return key
     return _ACTION_SYNONYMS.get(key, "comment")
