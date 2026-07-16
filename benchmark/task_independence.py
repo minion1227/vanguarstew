@@ -21,6 +21,11 @@ overlap. Nothing gates window overlap.
 3. ``windows_independent`` — every pair of freeze indices differs by more than ``horizon`` (so the
    ``[f, f+horizon]`` spans are disjoint). Trivially true for a single task.
 
+A TIME-horizon task set (taskgen's ``horizon_days`` mode) carries ``horizon_days``/``freeze_date``
+per task; there the windows span DAYS, so ``windows_independent`` compares freeze *dates* against
+``horizon_days`` instead — two freezes 6 commits apart clear ``horizon=5`` yet can sit inside the
+same 90-day window. Same invariant, measured in the dimension the window actually spans.
+
 The companion ``scripts/task_independence.py`` exits non-zero when the windows overlap.
 
 Pure evaluation: no I/O, never mutates its input, and a malformed/non-list task set simply fails
@@ -29,6 +34,13 @@ the relevant checks rather than raising.
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+_CHECK_ROW_KEYS = ("name", "passed")
+
 # Matches the default replay horizon in ``taskgen.generate_tasks`` / ``run_replay``. Pass the
 # horizon the tasks were generated with; it is echoed in the result so a mismatch is visible.
 DEFAULT_HORIZON = 5
@@ -36,6 +48,62 @@ DEFAULT_HORIZON = 5
 
 def _dict(value) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+def _check_rows_list(checks) -> list:
+    """Return the usable check rows for the ``failed_checks`` / headline helpers.
+
+    ``None`` means the ``checks`` key is absent and an empty list means zero checks -- both are
+    silent. A non-list container is warned and treated as empty rather than coerced, so a
+    hand-built or deserialized result whose ``checks`` isn't a list can't crash the ``row["name"]``
+    access. A usable row is a dict with a ``str`` ``name`` and a ``bool`` ``passed``; anything else
+    is skipped with a warning. Mirrors the sanitizer used by the other gates (e.g.
+    ``generalization_gate``, ``skip_budget``).
+    """
+    if checks is None:
+        return []
+    if not isinstance(checks, list):
+        logger.warning(
+            "task_independence: checks is %s, not a list; treating as empty", type(checks).__name__)
+        return []
+    rows = []
+    for idx, row in enumerate(checks):
+        if not isinstance(row, dict):
+            logger.warning(
+                "task_independence: checks[%s] is %s, not an object; skipping", idx, type(row).__name__)
+            continue
+        missing = [key for key in _CHECK_ROW_KEYS if key not in row]
+        if missing:
+            logger.warning(
+                "task_independence: checks[%s] missing required key(s) %s; skipping", idx, missing)
+            continue
+        if not isinstance(row["name"], str):
+            logger.warning(
+                "task_independence: checks[%s] name is %s, not str; skipping",
+                idx, type(row["name"]).__name__)
+            continue
+        if not isinstance(row["passed"], bool):
+            logger.warning(
+                "task_independence: checks[%s] passed is %s, not bool; skipping",
+                idx, type(row["passed"]).__name__)
+            continue
+        rows.append(row)
+    if checks and not rows:
+        logger.warning(
+            "task_independence: checks had %d entr%s but no usable rows",
+            len(checks), "y" if len(checks) == 1 else "ies")
+    return rows
+
+
+def _as_dt(value):
+    """Parse a task's ISO ``freeze_date``, or ``None`` when absent/unparseable (fails closed to
+    the commit-index check rather than raising)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _is_nonneg_int(value) -> bool:
@@ -70,12 +138,37 @@ def check_task_independence(tasks, horizon: int = DEFAULT_HORIZON) -> dict:
         "every task has a non-negative integer freeze_index" if indices_valid
         else "a task is missing a non-negative integer freeze_index")
 
+    # A TIME-horizon task set (taskgen's `horizon_days` mode) reveals everything landing in the
+    # next N DAYS, so its windows overlap in time, not in commit count: two freeze points 6 commits
+    # apart are independent under horizon=5 but can sit inside the same 90-day window and overlap
+    # badly. Measure the gap in the same dimension the window spans. The invariant is unchanged
+    # (no task's freeze may sit inside an earlier task's revealed future); only its dimension
+    # follows the horizon.
+    spans = [t.get("horizon_days") for t in dict_tasks]
+    dates = [_as_dt(t.get("freeze_date")) for t in dict_tasks]
+    time_mode = (all_dicts and bool(spans)
+                 and all(isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in spans)
+                 and all(d is not None for d in dates))
+
     min_gap = None
-    if indices_valid and len(indices) >= 2:
+    if time_mode and len(dates) >= 2:
+        ordered = sorted(dates)
+        min_gap = min((b - a).total_seconds() / 86400.0 for a, b in zip(ordered, ordered[1:]))
+    elif indices_valid and len(indices) >= 2:
         ordered = sorted(indices)
         min_gap = min(b - a for a, b in zip(ordered, ordered[1:]))
 
-    if not indices_valid:
+    if time_mode:
+        span = max(spans)
+        if min_gap is None:
+            add("windows_independent", True, "fewer than two tasks; trivially independent")
+        else:
+            ok = min_gap > span
+            add("windows_independent", ok,
+                f"smallest freeze-date gap {min_gap:.1f}d > horizon_days {span}" if ok
+                else f"freeze dates only {min_gap:.1f}d apart <= horizon_days {span} "
+                     f"(windows overlap)")
+    elif not indices_valid:
         add("windows_independent", False, "cannot check independence (invalid freeze_index)")
     elif min_gap is None:
         add("windows_independent", True, "fewer than two tasks; trivially independent")
@@ -95,18 +188,19 @@ def check_task_independence(tasks, horizon: int = DEFAULT_HORIZON) -> dict:
 
 
 def failed_checks(result: dict) -> list:
-    """The names of the checks that failed in a :func:`check_task_independence` result."""
-    checks = _dict(result).get("checks")
-    if not isinstance(checks, list):
-        return []
-    return [c["name"] for c in checks if isinstance(c, dict) and not c.get("passed")]
+    """The names of the checks that failed in a :func:`check_task_independence` result.
+
+    Malformed ``checks`` containers and rows (non-list, non-dict, or missing ``name``/``passed``)
+    are skipped after a warning rather than raising, via :func:`_check_rows_list`.
+    """
+    return [c["name"] for c in _check_rows_list(_dict(result).get("checks")) if not c["passed"]]
 
 
 def task_independence_headline(result: dict) -> str:
     """A one-line human summary of a :func:`check_task_independence` result."""
     result = _dict(result)
-    checks = result.get("checks")
-    if not isinstance(checks, list) or not checks:
+    checks = _check_rows_list(result.get("checks"))
+    if not checks:
         return "task independence: no checks evaluated"
     if result.get("passed"):
         return f"task independence: INDEPENDENT ({result.get('task_count')} tasks, all checks passed)"

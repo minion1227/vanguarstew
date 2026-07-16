@@ -7,10 +7,13 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import scripts.tally_integrity as tally_integrity_cli  # noqa: E402
 from benchmark.tally_integrity import (  # noqa: E402
     _check_rows_list,
     _count_row_winners,
@@ -109,6 +112,21 @@ def test_zero_tasks_slice_is_not_selected():
     result = check_tally_integrity({"tasks": 0, "tally": {"challenger": 0, "baseline": 0, "tie": 0}})
     assert result["passed"] is False
     assert failed_checks(result) == ["artifact_shape"]
+
+
+def test_zero_task_slice_with_empty_rows_is_consistent():
+    # A real run_replay zero-task slice emits rows: [] (an EMPTY list, not an absent key). The
+    # recount of [] equals the all-zero tally, so row_winners_match_tally must be True and the
+    # artifact CONSISTENT. An empty rows list must not be conflated with a missing one -- the
+    # check used `and rows:` (empty list is falsy) where its sibling rows_match_tasks correctly
+    # uses `rows is not None`.
+    art = {"tasks": 0, "tally": {"challenger": 0, "baseline": 0, "tie": 0},
+           "rows": [], "decisive_margin": 0}
+    result = check_tally_integrity(art)
+    assert result["passed"] is True
+    assert failed_checks(result) == []
+    row_check = next(c for c in result["checks"] if c["name"] == "row_winners_match_tally")
+    assert row_check["passed"] is True
 
 
 def test_non_finite_tally_count_fails_instead_of_raising():
@@ -428,7 +446,38 @@ def test_cli_reports_clean_error_for_missing_file(tmp_path):
     result = _run_cli(str(missing), "--strict")
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
-    assert "No such file" in result.stderr
+    assert "artifact not found" in result.stderr
+
+
+def test_cli_directory_path_reports_clean_error(tmp_path):
+    result = _run_cli(str(tmp_path))
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "directory" in result.stderr
+
+
+def test_load_artifact_is_a_directory_error_is_handled(monkeypatch, tmp_path, capsys):
+    def _raise(*args, **kwargs):
+        raise IsADirectoryError(21, "Is a directory")
+
+    monkeypatch.setattr("builtins.open", _raise)
+    with pytest.raises(SystemExit) as excinfo:
+        tally_integrity_cli.load_artifact(str(tmp_path / "run.json"))
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "artifact path is a directory, not a file" in err and "Traceback" not in err
+
+
+def test_load_artifact_permission_error_is_handled(monkeypatch, tmp_path, capsys):
+    def _raise(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("builtins.open", _raise)
+    with pytest.raises(SystemExit) as excinfo:
+        tally_integrity_cli.load_artifact(str(tmp_path / "run.json"))
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "not readable" in err and "Traceback" not in err
 
 
 def test_cli_reports_clean_error_for_non_object_artifact(tmp_path):
@@ -445,3 +494,4 @@ def test_cli_reports_clean_error_for_invalid_json(tmp_path):
     result = _run_cli(str(path))
     assert result.returncode == 1
     assert "Traceback" not in result.stderr
+    assert "artifact is not valid JSON" in result.stderr

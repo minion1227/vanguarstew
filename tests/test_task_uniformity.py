@@ -132,6 +132,30 @@ def test_failed_checks_helper_is_robust():
     assert failed_checks(check_task_uniformity([])) != []
 
 
+def test_failed_checks_survives_check_row_missing_name():
+    # A dict check row missing "name" must be skipped, not raise KeyError -- the previous guard only
+    # handled a non-list checks container. Mirrors the sibling gates' _check_rows_list sanitizer.
+    assert failed_checks({"checks": [{"passed": False}]}) == []
+    assert failed_checks({"checks": [{"name": "windows_uniform", "passed": False},
+                                     {"passed": False}]}) == ["windows_uniform"]
+
+
+def test_failed_checks_skips_non_dict_and_non_str_name_rows():
+    result = {"checks": [42, {"name": 99, "passed": False},
+                         {"name": "windows_uniform", "passed": False}]}
+    assert failed_checks(result) == ["windows_uniform"]
+
+
+def test_headline_survives_check_row_missing_name():
+    headline = task_uniformity_headline({
+        "passed": False, "task_count": 2,
+        "checks": [{"name": "windows_uniform", "passed": False}, {"passed": False}],
+    })
+    assert "UNEVEN" in headline
+    assert "1/1" in headline     # the malformed row is excluded from numerator AND denominator
+    assert "windows_uniform" in headline
+
+
 def test_check_task_uniformity_does_not_mutate_input():
     tasks = [_task(5, 0), _task(5, 6)]
     snapshot = copy.deepcopy(tasks)
@@ -195,3 +219,37 @@ def test_cli_main_exits_with_the_return_code(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code == 1
+
+
+# --- time-horizon mode (taskgen `horizon_days`): equal weight = equal SPAN, not equal count ---
+
+def _time_task(span, n_revealed, date="2020-01-01T00:00:00+00:00"):
+    return {"freeze_commit": "a" * 10, "freeze_index": 0, "horizon_days": span,
+            "freeze_date": date, "revealed": [{"sha": "x", "subject": "s", "files": []}] * n_revealed}
+
+
+def test_time_mode_varying_revealed_lengths_still_uniform():
+    # The whole point of a time window: a busy month reveals more commits than a quiet one.
+    # That variance is BY DESIGN and must not fail the equal-weight gate.
+    tasks = [_time_task(90, 3), _time_task(90, 17), _time_task(90, 9)]
+    result = check_task_uniformity(tasks)
+    assert result["passed"] is True
+    assert "uniform_window_span" in [c["name"] for c in result["checks"]]
+    assert "uniform_window_length" not in [c["name"] for c in result["checks"]]
+
+
+def test_time_mode_differing_spans_fail():
+    # Different spans DO break equal weighting — one task judged over 90d, another over 30d.
+    tasks = [_time_task(90, 5), _time_task(30, 5)]
+    result = check_task_uniformity(tasks)
+    assert result["passed"] is False
+    assert "uniform_window_span" in failed_checks(result)
+
+
+def test_commit_mode_unaffected_by_time_mode_branch():
+    # No horizon_days -> the original commit-count check still governs.
+    tasks = [{"freeze_index": 0, "revealed": [{"sha": "x"}] * 5},
+             {"freeze_index": 9, "revealed": [{"sha": "y"}] * 2}]
+    result = check_task_uniformity(tasks)
+    assert result["passed"] is False
+    assert "uniform_window_length" in failed_checks(result)

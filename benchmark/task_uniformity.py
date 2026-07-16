@@ -23,6 +23,12 @@ Neither checks that the windows are the **same length** — this does. The check
    empty list, or a non-list all fail);
 3. ``uniform_window_length`` — every task's ``revealed`` window has the same length.
 
+A TIME-horizon task set (taskgen's ``horizon_days`` mode) carries its span per task and reports
+``uniform_window_span`` instead: there, equal weight means an equal *span*, not an equal commit
+count — a 90-day window over a busy month reveals more commits than over a quiet one, and that
+variance is the design (a maintainer's week off averages out rather than dominating a 5-commit
+sample). Same invariant (equal-weight samples), measured along the horizon's own dimension.
+
 The companion ``scripts/task_uniformity.py`` exits non-zero when the windows are uneven.
 
 Pure evaluation: no I/O, never mutates its input, and a malformed/non-list task set simply fails
@@ -30,6 +36,12 @@ the relevant checks rather than raising. No thresholds — uniformity is judged 
 """
 
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+_CHECK_ROW_KEYS = ("name", "passed")
 
 
 def _dict(value) -> dict:
@@ -40,6 +52,51 @@ def _dict(value) -> dict:
     explicitly type-checked in :func:`check_task_uniformity` and its actual type is reported.
     """
     return value if isinstance(value, dict) else {}
+
+
+def _check_rows_list(checks) -> list:
+    """Return the usable check rows for the ``failed_checks`` / headline helpers.
+
+    ``None`` means the ``checks`` key is absent and an empty list means zero checks -- both are
+    silent. A non-list container is warned and treated as empty rather than coerced, so a
+    hand-built or deserialized result whose ``checks`` isn't a list can't crash the ``row["name"]``
+    access. A usable row is a dict with a ``str`` ``name`` and a ``bool`` ``passed``; anything else
+    is skipped with a warning. Mirrors the sanitizer used by the other gates (e.g.
+    ``generalization_gate``, ``skip_budget``).
+    """
+    if checks is None:
+        return []
+    if not isinstance(checks, list):
+        logger.warning(
+            "task_uniformity: checks is %s, not a list; treating as empty", type(checks).__name__)
+        return []
+    rows = []
+    for idx, row in enumerate(checks):
+        if not isinstance(row, dict):
+            logger.warning(
+                "task_uniformity: checks[%s] is %s, not an object; skipping", idx, type(row).__name__)
+            continue
+        missing = [key for key in _CHECK_ROW_KEYS if key not in row]
+        if missing:
+            logger.warning(
+                "task_uniformity: checks[%s] missing required key(s) %s; skipping", idx, missing)
+            continue
+        if not isinstance(row["name"], str):
+            logger.warning(
+                "task_uniformity: checks[%s] name is %s, not str; skipping",
+                idx, type(row["name"]).__name__)
+            continue
+        if not isinstance(row["passed"], bool):
+            logger.warning(
+                "task_uniformity: checks[%s] passed is %s, not bool; skipping",
+                idx, type(row["passed"]).__name__)
+            continue
+        rows.append(row)
+    if checks and not rows:
+        logger.warning(
+            "task_uniformity: checks had %d entr%s but no usable rows",
+            len(checks), "y" if len(checks) == 1 else "ies")
+    return rows
 
 
 def _window_len(task: dict):
@@ -78,8 +135,25 @@ def check_task_uniformity(tasks) -> dict:
         "every task has a non-empty revealed window" if windows_present
         else "a task has a missing, empty, or non-list revealed window")
 
+    # A TIME-horizon task set (taskgen's `horizon_days` mode) carries its span per task. There,
+    # equal weight means an equal *span*, NOT an equal commit count: a 90-day window over a busy
+    # month legitimately reveals more commits than over a quiet one, and that variance is the
+    # design — the point of a time window is that a maintainer's week off averages out instead of
+    # dominating a 5-commit sample. Checking commit-count uniformity there would fail every honest
+    # run. The invariant is unchanged (tasks must be equal-weight samples); only the dimension it
+    # is measured in follows the horizon.
+    spans = [t.get("horizon_days") for t in dict_tasks]
+    time_mode = all_dicts and bool(spans) and all(
+        isinstance(s, int) and not isinstance(s, bool) and s > 0 for s in spans)
     distinct = sorted({n for n in lengths if n is not None})
-    if not windows_present:
+    if time_mode:
+        distinct_spans = sorted(set(spans))
+        uniform = len(distinct_spans) == 1
+        add("uniform_window_span", uniform,
+            f"all {len(spans)} windows span {distinct_spans[0]} day(s) "
+            f"(revealed lengths {distinct} vary by design)" if uniform
+            else f"window spans differ: {distinct_spans} day(s)")
+    elif not windows_present:
         add("uniform_window_length", False, "cannot compare window lengths (a window is missing)")
     else:
         uniform = len(distinct) == 1
@@ -98,18 +172,19 @@ def check_task_uniformity(tasks) -> dict:
 
 
 def failed_checks(result: dict) -> list:
-    """The names of the checks that failed in a :func:`check_task_uniformity` result."""
-    checks = _dict(result).get("checks")
-    if not isinstance(checks, list):
-        return []
-    return [c["name"] for c in checks if isinstance(c, dict) and not c.get("passed")]
+    """The names of the checks that failed in a :func:`check_task_uniformity` result.
+
+    Malformed ``checks`` containers and rows (non-list, non-dict, or missing ``name``/``passed``)
+    are skipped after a warning rather than raising, via :func:`_check_rows_list`.
+    """
+    return [c["name"] for c in _check_rows_list(_dict(result).get("checks")) if not c["passed"]]
 
 
 def task_uniformity_headline(result: dict) -> str:
     """A one-line human summary of a :func:`check_task_uniformity` result."""
     result = _dict(result)
-    checks = result.get("checks")
-    if not isinstance(checks, list) or not checks:
+    checks = _check_rows_list(result.get("checks"))
+    if not checks:
         return "task uniformity: no checks evaluated"
     if result.get("passed"):
         return (f"task uniformity: UNIFORM ({result.get('task_count')} tasks, "
